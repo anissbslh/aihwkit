@@ -12,3 +12,4 @@ numpy>=1.22,<2
 protobuf>=4.21.6
 tqdm
 mypy==0.991
+rich
