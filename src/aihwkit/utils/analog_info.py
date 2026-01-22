@@ -15,11 +15,54 @@ Enhancements (issue #316 follow-ups):
 - Improved layout (no confusing placeholder entries)
 - Optional accounting for peripheral digital ops (noise/bound mgmt, etc.) via configurable factors
 - Optional counting of backward / update passes (for analog training)
+- Optional estimation of peripheral ops from RPU settings
 - Hooks for analog optimizer specifics (tiki-taka / mixed precision) to account for extra internal tiles / ops
 
 Notes:
 - MAC / mat-vec counts are estimates based on tensor shapes observed in a dummy forward pass.
 - Peripheral ops and optimizer-specific overhead are model/config dependent: exposed via user parameters/callbacks.
+
+Example:
+    >>> import torch
+    >>> from torch import nn
+    >>> from aihwkit.nn import AnalogLinear
+    >>> from aihwkit.simulator.presets import TikiTakaIdealizedPreset, MixedPrecisionIdealizedPreset
+    >>> from aihwkit.utils.analog_info import analog_summary
+    >>>
+    >>> rpu_config = TikiTakaIdealizedPreset()
+    >>> model = nn.Sequential(
+    ...     AnalogLinear(128, 64, rpu_config=rpu_config),
+    ...     nn.ReLU(),
+    ...     nn.Linear(64, 10),
+    ... )
+    >>> info = analog_summary(
+    ...     model,
+    ...     input_size=(1, 128),
+    ...     rpu_config=rpu_config,
+    ...     include_backward=True,
+    ...     include_update=True,
+    ...     estimate_peripheral_ops=True,
+    ...     estimate_optimizer_overhead=True,
+    ...     peripheral_ops_per_matvec=2,
+    ... )
+    >>> print(info)
+    >>>
+    >>> mp_config = MixedPrecisionIdealizedPreset()
+    >>> mp_model = nn.Sequential(
+    ...     AnalogLinear(128, 64, rpu_config=mp_config),
+    ...     nn.ReLU(),
+    ...     nn.Linear(64, 10),
+    ... )
+    >>> mp_info = analog_summary(
+    ...     mp_model,
+    ...     input_size=(1, 128),
+    ...     rpu_config=mp_config,
+    ...     include_backward=True,
+    ...     include_update=True,
+    ...     estimate_peripheral_ops=True,
+    ...     estimate_optimizer_overhead=True,
+    ... )
+    >>> print(mp_info)
 """
 
 from functools import reduce
@@ -37,6 +80,9 @@ from aihwkit.nn.modules.conv import _AnalogConvNd
 from aihwkit.nn import AnalogLinear
 from aihwkit.simulator.tiles.module import TileModule
 from aihwkit.simulator.parameters.base import RPUConfigBase
+from aihwkit.simulator.parameters.enums import BoundManagementType, NoiseManagementType
+from aihwkit.simulator.configs.compounds import MixedPrecisionCompound, TransferCompound
+from aihwkit.simulator.configs.configs import DigitalRankUpdateRPUConfig, UnitCellRPUConfig
 
 
 try:
@@ -177,6 +223,8 @@ class LayerInfo:
         include_backward: bool = False,
         include_update: bool = False,
         peripheral_ops_per_matvec: int = 0,
+        estimate_peripheral_ops: bool = False,
+        estimate_optimizer_overhead: bool = False,
         extra_tiles_fn: Optional[Callable[[Module, Optional[RPUConfigBase]], int]] = None,
         extra_digital_ops_fn: Optional[Callable[[Module, Optional[RPUConfigBase]], int]] = None,
     ):
@@ -184,17 +232,24 @@ class LayerInfo:
         self.name = self.module.__class__.__name__
         self.isanalog = isinstance(self.module, AnalogLayerBase)
 
+        self.include_backward = include_backward
+        self.include_update = include_update
+        self.rpu_config = rpu_config
+
         base_tiles = 0 if not self.isanalog else len(list(self.module.analog_tiles()))
-        extra_tiles = extra_tiles_fn(self.module, rpu_config) if extra_tiles_fn else 0
-        self.num_tiles = base_tiles + int(extra_tiles)
 
         self.tiles_info = self.set_tiles_info()
         self.kernel_size = None
         self.reuse_factor = 0
         self.input_size, self.output_size = input_size, output_size
-        self.rpu_config = rpu_config
         self.set_kernel_size()
         self.calculate_reuse_factor()
+
+        optimizer_extra_tiles, optimizer_extra_ops = self._estimate_optimizer_overhead(
+            base_tiles, estimate_optimizer_overhead
+        )
+        extra_tiles = extra_tiles_fn(self.module, rpu_config) if extra_tiles_fn else 0
+        self.num_tiles = base_tiles + int(optimizer_extra_tiles) + int(extra_tiles)
 
         # Pass factors: forward always counted once
         pass_factor = 1 + (1 if include_backward else 0) + (1 if include_update else 0)
@@ -204,9 +259,13 @@ class LayerInfo:
         self.analog_matvecs = self._estimate_analog_matvecs() * pass_factor if self.isanalog else 0
 
         base_periph = int(peripheral_ops_per_matvec) * self.analog_matvecs
+        estimated_periph = (
+            self._estimate_peripheral_ops() if estimate_peripheral_ops and self.isanalog else 0
+        )
         extra_digital = extra_digital_ops_fn(self.module, rpu_config) if extra_digital_ops_fn else 0
+        extra_digital += optimizer_extra_ops
         # peripheral ops are digital-ish overhead around analog compute
-        self.peripheral_ops = int(base_periph + extra_digital) if self.isanalog else 0
+        self.peripheral_ops = int(base_periph + estimated_periph + extra_digital) if self.isanalog else 0
 
     def set_tiles_info(self) -> List[TileInfo]:
         """Create TileInfo objects for each tile of the layer."""
@@ -239,6 +298,113 @@ class LayerInfo:
         elif isinstance(self.module, (AnalogLinear, AnalogLinearMapped)):
             ruf = _prod(self.input_size) // int(self.input_size[-1])
             self.reuse_factor = int(ruf)
+
+    def _estimate_vector_lengths(self) -> Tuple[int, int]:
+        """Estimate input/output vector lengths for a single mat-vec."""
+        # Linear-like
+        if hasattr(self.module, "in_features") and hasattr(self.module, "out_features"):
+            in_f = int(getattr(self.module, "in_features"))
+            out_f = int(getattr(self.module, "out_features"))
+            return in_f, out_f
+
+        # Conv-like
+        if hasattr(self.module, "kernel_size") and hasattr(self.module, "in_channels") and hasattr(
+            self.module, "out_channels"
+        ):
+            cin = int(getattr(self.module, "in_channels"))
+            cout = int(getattr(self.module, "out_channels"))
+            k = getattr(self.module, "kernel_size")
+            if isinstance(k, int):
+                k_elems = int(k * k)
+            else:
+                k_elems = int(_prod(list(k)))
+            return cin * k_elems, cout
+
+        return 0, 0
+
+    def _estimate_noise_mgmt_ops(self, input_len: int, nm_type: NoiseManagementType) -> int:
+        """Estimate digital ops for noise management per mat-vec."""
+        if nm_type in (NoiseManagementType.NONE, NoiseManagementType.CONSTANT):
+            return 0
+        if nm_type == NoiseManagementType.AVERAGE_ABS_MAX:
+            return int(2 * input_len + 1)
+        return int(2 * input_len)
+
+    def _estimate_bound_mgmt_ops(
+        self, input_len: int, output_len: int, bm_type: BoundManagementType
+    ) -> int:
+        """Estimate digital ops for bound management per mat-vec."""
+        if bm_type == BoundManagementType.NONE:
+            return 0
+        if bm_type == BoundManagementType.SHIFT:
+            return int(output_len)
+        if bm_type == BoundManagementType.ITERATIVE_WORST_CASE:
+            return int(2 * (input_len + output_len))
+        return int(input_len + output_len)
+
+    def _estimate_peripheral_ops(self) -> int:
+        """Estimate peripheral digital ops for forward/backward/update passes."""
+        if self.reuse_factor == 0 or self.rpu_config is None:
+            return 0
+
+        input_len, output_len = self._estimate_vector_lengths()
+        if input_len == 0 and output_len == 0:
+            return 0
+
+        ops = 0
+        # Forward pass
+        ops += self._estimate_noise_mgmt_ops(
+            input_len, self.rpu_config.forward.noise_management
+        )
+        ops += self._estimate_bound_mgmt_ops(
+            input_len, output_len, self.rpu_config.forward.bound_management
+        )
+
+        # Backward pass (if requested)
+        if self.include_backward:
+            ops += self._estimate_noise_mgmt_ops(
+                output_len, self.rpu_config.backward.noise_management
+            )
+            ops += self._estimate_bound_mgmt_ops(
+                output_len, input_len, self.rpu_config.backward.bound_management
+            )
+
+        # Per mat-vec ops -> scale by reuse and tile count
+        total = ops * self.reuse_factor * self.num_tiles
+        return int(total)
+
+    def _estimate_optimizer_overhead(
+        self, base_tiles: int, estimate_optimizer_overhead: bool
+    ) -> Tuple[int, int]:
+        """Estimate extra tiles and digital ops for optimizer-specific overhead."""
+        if not estimate_optimizer_overhead or not self.isanalog or self.rpu_config is None:
+            return 0, 0
+
+        input_len, output_len = self._estimate_vector_lengths()
+        extra_tiles = 0
+        extra_ops = 0
+
+        if isinstance(self.rpu_config, UnitCellRPUConfig) and isinstance(
+            self.rpu_config.device, TransferCompound
+        ):
+            n_devices = len(self.rpu_config.device.unit_cell_devices)
+            extra_tiles = max(0, n_devices - 1) * base_tiles
+            if self.include_update and self.rpu_config.device.transfer_every > 0:
+                transfers = self.reuse_factor / float(self.rpu_config.device.transfer_every)
+                read_len = input_len if self.rpu_config.device.transfer_columns else output_len
+                extra_ops = int(
+                    transfers * self.rpu_config.device.n_reads_per_transfer * (read_len + output_len)
+                )
+
+        if isinstance(self.rpu_config, DigitalRankUpdateRPUConfig) and isinstance(
+            self.rpu_config.device, MixedPrecisionCompound
+        ):
+            extra_tiles = max(extra_tiles, base_tiles)
+            if self.include_update:
+                transfer_every = max(1, int(self.rpu_config.device.transfer_every))
+                extra_ops += int(self.reuse_factor * input_len * output_len / transfer_every)
+
+        return int(extra_tiles), int(extra_ops)
 
 
     def _estimate_digital_macs(self) -> int:
@@ -315,6 +481,8 @@ class AnalogInfo:
         include_backward: bool = False,
         include_update: bool = False,
         peripheral_ops_per_matvec: int = 0,
+        estimate_peripheral_ops: bool = False,
+        estimate_optimizer_overhead: bool = False,
         extra_tiles_fn: Optional[Callable[[Module, Optional[RPUConfigBase]], int]] = None,
         extra_digital_ops_fn: Optional[Callable[[Module, Optional[RPUConfigBase]], int]] = None,
     ):
@@ -329,6 +497,8 @@ class AnalogInfo:
         self.include_backward = include_backward
         self.include_update = include_update
         self.peripheral_ops_per_matvec = peripheral_ops_per_matvec
+        self.estimate_peripheral_ops = estimate_peripheral_ops
+        self.estimate_optimizer_overhead = estimate_optimizer_overhead
         self.extra_tiles_fn = extra_tiles_fn
         self.extra_digital_ops_fn = extra_digital_ops_fn
 
@@ -371,6 +541,8 @@ class AnalogInfo:
                     include_backward=self.include_backward,
                     include_update=self.include_update,
                     peripheral_ops_per_matvec=self.peripheral_ops_per_matvec,
+                    estimate_peripheral_ops=self.estimate_peripheral_ops,
+                    estimate_optimizer_overhead=self.estimate_optimizer_overhead,
                     extra_tiles_fn=self.extra_tiles_fn,
                     extra_digital_ops_fn=self.extra_digital_ops_fn,
                 )
@@ -627,6 +799,8 @@ def analog_summary(
     include_backward: bool = False,
     include_update: bool = False,
     peripheral_ops_per_matvec: int = 0,
+    estimate_peripheral_ops: bool = False,
+    estimate_optimizer_overhead: bool = False,
     extra_tiles_fn: Optional[Callable[[Module, Optional[RPUConfigBase]], int]] = None,
     extra_digital_ops_fn: Optional[Callable[[Module, Optional[RPUConfigBase]], int]] = None,
 ) -> AnalogInfo:
@@ -649,6 +823,8 @@ def analog_summary(
         include_backward: if True, counts are scaled to include backward pass.
         include_update: if True, counts are scaled to include update pass.
         peripheral_ops_per_matvec: estimate of extra digital ops per analog mat-vec.
+        estimate_peripheral_ops: if True, estimates per-matvec peripheral ops from RPU settings.
+        estimate_optimizer_overhead: if True, estimates optimizer-specific extra tiles/ops.
         extra_tiles_fn: callback(module, rpu_config)->int for optimizer internals (e.g. tiki-taka).
         extra_digital_ops_fn: callback(module, rpu_config)->int for optimizer/peripheral overhead.
 
@@ -663,6 +839,8 @@ def analog_summary(
         include_backward=include_backward,
         include_update=include_update,
         peripheral_ops_per_matvec=peripheral_ops_per_matvec,
+        estimate_peripheral_ops=estimate_peripheral_ops,
+        estimate_optimizer_overhead=estimate_optimizer_overhead,
         extra_tiles_fn=extra_tiles_fn,
         extra_digital_ops_fn=extra_digital_ops_fn,
     )
