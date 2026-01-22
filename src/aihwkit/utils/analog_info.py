@@ -21,6 +21,32 @@ Enhancements (issue #316 follow-ups):
 Notes:
 - MAC / mat-vec counts are estimates based on tensor shapes observed in a dummy forward pass.
 - Peripheral ops and optimizer-specific overhead are model/config dependent: exposed via user parameters/callbacks.
+
+Example:
+    >>> import torch
+    >>> from torch import nn
+    >>> from aihwkit.nn import AnalogLinear
+    >>> from aihwkit.simulator.configs.configs import UnitCellRPUConfig
+    >>> from aihwkit.simulator.configs.compounds import TransferCompound
+    >>> from aihwkit.utils.analog_info import analog_summary
+    >>>
+    >>> rpu_config = UnitCellRPUConfig(device=TransferCompound())
+    >>> model = nn.Sequential(
+    ...     AnalogLinear(128, 64, rpu_config=rpu_config),
+    ...     nn.ReLU(),
+    ...     nn.Linear(64, 10),
+    ... )
+    >>> info = analog_summary(
+    ...     model,
+    ...     input_size=(1, 128),
+    ...     rpu_config=rpu_config,
+    ...     include_backward=True,
+    ...     include_update=True,
+    ...     estimate_peripheral_ops=True,
+    ...     estimate_optimizer_overhead=True,
+    ...     peripheral_ops_per_matvec=2,
+    ... )
+    >>> print(info)
 """
 
 from functools import reduce
