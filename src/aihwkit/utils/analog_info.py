@@ -26,11 +26,10 @@ Example:
     >>> import torch
     >>> from torch import nn
     >>> from aihwkit.nn import AnalogLinear
-    >>> from aihwkit.simulator.configs.configs import UnitCellRPUConfig
-    >>> from aihwkit.simulator.configs.compounds import TransferCompound
+    >>> from aihwkit.simulator.presets import TikiTakaIdealizedPreset, MixedPrecisionIdealizedPreset
     >>> from aihwkit.utils.analog_info import analog_summary
     >>>
-    >>> rpu_config = UnitCellRPUConfig(device=TransferCompound())
+    >>> rpu_config = TikiTakaIdealizedPreset()
     >>> model = nn.Sequential(
     ...     AnalogLinear(128, 64, rpu_config=rpu_config),
     ...     nn.ReLU(),
@@ -47,6 +46,23 @@ Example:
     ...     peripheral_ops_per_matvec=2,
     ... )
     >>> print(info)
+    >>>
+    >>> mp_config = MixedPrecisionIdealizedPreset()
+    >>> mp_model = nn.Sequential(
+    ...     AnalogLinear(128, 64, rpu_config=mp_config),
+    ...     nn.ReLU(),
+    ...     nn.Linear(64, 10),
+    ... )
+    >>> mp_info = analog_summary(
+    ...     mp_model,
+    ...     input_size=(1, 128),
+    ...     rpu_config=mp_config,
+    ...     include_backward=True,
+    ...     include_update=True,
+    ...     estimate_peripheral_ops=True,
+    ...     estimate_optimizer_overhead=True,
+    ... )
+    >>> print(mp_info)
 """
 
 from functools import reduce
