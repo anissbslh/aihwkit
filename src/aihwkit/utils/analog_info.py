@@ -237,11 +237,6 @@ class LayerInfo:
         self.rpu_config = rpu_config
 
         base_tiles = 0 if not self.isanalog else len(list(self.module.analog_tiles()))
-        optimizer_extra_tiles, optimizer_extra_ops = self._estimate_optimizer_overhead(
-            base_tiles, estimate_optimizer_overhead
-        )
-        extra_tiles = extra_tiles_fn(self.module, rpu_config) if extra_tiles_fn else 0
-        self.num_tiles = base_tiles + int(optimizer_extra_tiles) + int(extra_tiles)
 
         self.tiles_info = self.set_tiles_info()
         self.kernel_size = None
@@ -249,6 +244,12 @@ class LayerInfo:
         self.input_size, self.output_size = input_size, output_size
         self.set_kernel_size()
         self.calculate_reuse_factor()
+
+        optimizer_extra_tiles, optimizer_extra_ops = self._estimate_optimizer_overhead(
+            base_tiles, estimate_optimizer_overhead
+        )
+        extra_tiles = extra_tiles_fn(self.module, rpu_config) if extra_tiles_fn else 0
+        self.num_tiles = base_tiles + int(optimizer_extra_tiles) + int(extra_tiles)
 
         # Pass factors: forward always counted once
         pass_factor = 1 + (1 if include_backward else 0) + (1 if include_update else 0)
