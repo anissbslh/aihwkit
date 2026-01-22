@@ -218,6 +218,7 @@ class LayerInfo:
 
         self.include_backward = include_backward
         self.include_update = include_update
+        self.rpu_config = rpu_config
 
         base_tiles = 0 if not self.isanalog else len(list(self.module.analog_tiles()))
         optimizer_extra_tiles, optimizer_extra_ops = self._estimate_optimizer_overhead(
@@ -230,7 +231,6 @@ class LayerInfo:
         self.kernel_size = None
         self.reuse_factor = 0
         self.input_size, self.output_size = input_size, output_size
-        self.rpu_config = rpu_config
         self.set_kernel_size()
         self.calculate_reuse_factor()
 
